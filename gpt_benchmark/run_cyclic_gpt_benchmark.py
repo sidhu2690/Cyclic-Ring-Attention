@@ -77,7 +77,7 @@ class ExperimentConfig:
     seed: int = 0
 
     # io
-    data_dir: str = "/media/storage/sidhu/cyclic_gpt_scale/data"
+    data_dir: str = "./data"
     out_dir: str = "./results_cyclic_gpt"
 
 
@@ -264,8 +264,12 @@ class LLaMAGPT(nn.Module):
         logits = self.lm_head(self.final_norm(x))
         loss = None
         if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)),
-                                   targets.view(-1), ignore_index=-1)
+            # reshape, not view: the batch here is a slice of a larger tensor
+            # (x[:, :-1] / x[:, 1:] from the same window), so it is not
+            # contiguous and view() raises. logits is contiguous, but reshape is
+            # correct for both.
+            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)),
+                                   targets.reshape(-1), ignore_index=-1)
         return logits, loss
 
     # ---------------------------------------------------------------- accounting
@@ -304,10 +308,11 @@ def init_paired_(model: LLaMAGPT, seed: int, verbose: bool = False):
     Cyclic and fewer_heads therefore start from identical weights, and normal
     agrees with them everywhere except that it owns an extra independent `wk`.
 
-    Note the deliberate consequence: all three models now share the same `w_qk`
-    draw, so at step 0 the normal model has W_Q = W_K. The first gradient step
-    separates them; this is a property of any paired-initialisation design and
-    is reported rather than hidden.
+    The normal model's `wk` is left independent (only `wq` is canonicalised), so
+    at step 0 its W_Q and W_K are different draws -- verified in checks.py. That
+    matters: a normal model that started on the symmetric point W_Q = W_K would
+    sit on the same Gram wall the paper's Section IV-C analyses, and would
+    handicap the baseline it is supposed to represent.
     """
     cfg = model.cfg
     n_layer = cfg.n_layer
@@ -409,6 +414,33 @@ class ShardedTokens:
         return out
 
 
+def resolve_data_dir(requested: str) -> str:
+    """Pick the data directory: the request, else ./data, else the original host path.
+
+    A hard-coded absolute path makes a repo unusable on any other machine, but
+    silently defaulting to ./data breaks the one machine the sweep already runs
+    on. Try them in order and say which one was used, rather than failing with
+    "no train shards" and no explanation.
+    """
+    candidates = [requested, "./data", os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")]
+    extra = os.environ.get("DATA_DIR")
+    if extra:
+        candidates.insert(0, extra)
+    for path in candidates:
+        if not path or not os.path.isdir(path):
+            continue
+        try:
+            discover_shards(path, "train")
+        except FileNotFoundError:
+            continue
+        print(f"[data] using {path}")
+        return path
+    raise FileNotFoundError(
+        "no train shards found. Pass --data_dir, set DATA_DIR, or put "
+        "fineweb_train_*.bin / fineweb_val_*.bin in ./data. "
+        f"Tried: {[c for c in candidates if c]}")
+
+
 def discover_shards(data_dir, split):
     names = sorted(f for f in os.listdir(data_dir)
                    if f.startswith(f"fineweb_{split}") and f.endswith(".bin"))
@@ -468,7 +500,7 @@ def evaluate(model, ds, cfg, device, rank, world_size, n_batches, lo, hi):
     for _ in range(n_batches):
         x, y = ds.get_batch(cfg.micro_batch_size, device, rng=rng,
                             start_lo=my_lo, start_hi=my_hi)
-        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+        with torch.amp.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
             _, loss = model(x, y)
         tot += loss.item() * y.numel()
         cnt += y.numel()
@@ -483,7 +515,8 @@ def evaluate(model, ds, cfg, device, rank, world_size, n_batches, lo, hi):
 def train_single_run(cfg, rank, world_size, device, val_window, test_window):
     is_master = rank == 0
     torch.manual_seed(cfg.seed)
-    torch.cuda.manual_seed_all(cfg.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(cfg.seed)
     np.random.seed(cfg.seed)
 
     model = LLaMAGPT(cfg)
@@ -498,8 +531,13 @@ def train_single_run(cfg, rank, world_size, device, val_window, test_window):
 
     ddp = None
     if dist.is_initialized():
-        ddp = DDP(model, device_ids=[device.index],
-                  broadcast_buffers=False)
+        # device_ids is a CUDA-only argument; on CPU (gloo) DDP takes the module
+        # as-is. This path exists so the DDP/resume logic can be tested without
+        # two GPUs.
+        if device.type == "cuda":
+            ddp = DDP(model, device_ids=[device.index], broadcast_buffers=False)
+        else:
+            ddp = DDP(model, broadcast_buffers=False)
     # The training step MUST go through the wrapper: calling the bare module
     # skips DDP.forward, so the reducer never registers the step and gradients
     # are never all-reduced. That silently trains on one GPU's data while
@@ -538,7 +576,8 @@ def train_single_run(cfg, rank, world_size, device, val_window, test_window):
               f"total {counts['total_params']:,} | QK {counts['qk_params']:,} | "
               f"{tokens_per_step:,} tok/step | {accum}x accum\n{'='*78}", flush=True)
 
-    torch.cuda.reset_peak_memory_stats(device)
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
     history = []
     best = float("inf")
     t_start = time.time()
@@ -557,7 +596,7 @@ def train_single_run(cfg, rank, world_size, device, val_window, test_window):
             if ddp is not None:
                 ddp.require_backward_grad_sync = (micro == accum - 1)
             x, y = train_ds.get_batch(cfg.micro_batch_size, device, rng=train_rng)
-            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            with torch.amp.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
                 _, loss = forward_model(x, y)
                 loss = loss / accum
             loss_accum += loss.item()
@@ -583,7 +622,8 @@ def train_single_run(cfg, rank, world_size, device, val_window, test_window):
                          cfg.eval_batches, *val_window)
     final_test = evaluate(model, val_ds, cfg, device, rank, world_size,
                           cfg.eval_batches, *test_window)
-    peak = torch.cuda.max_memory_allocated(device) / 2**20
+    peak = (torch.cuda.max_memory_allocated(device) / 2**20
+            if device.type == "cuda" else float("nan"))
     wall = time.time() - t_start
 
     return {
@@ -777,18 +817,27 @@ def main():
 
     distributed = "RANK" in os.environ and int(os.environ.get("WORLD_SIZE", 1)) > 1
     if distributed:
-        dist.init_process_group(backend="nccl")
+        # nccl on GPU, gloo otherwise, so the DDP path can be exercised on CPU
+        dist.init_process_group(backend="nccl" if torch.cuda.is_available() else "gloo")
         rank = int(os.environ["RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
-        torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
-        device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
+        if torch.cuda.is_available():
+            local_rank = int(os.environ["LOCAL_RANK"])
+            torch.cuda.set_device(local_rank)
+            device = torch.device(f"cuda:{local_rank}")
+        else:
+            device = torch.device("cpu")
     else:
         rank, world_size = 0, 1
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     is_master = rank == 0
 
-    train_paths = discover_shards(args.data_dir, "train")
-    val_paths = discover_shards(args.data_dir, "val")
+    # `./data` is the portable default. Fall back to the layout this benchmark
+    # was originally developed against, so the script runs unchanged on the host
+    # it came from without needing DATA_DIR exported. --data_dir still wins.
+    data_dir = resolve_data_dir(args.data_dir)
+    train_paths = discover_shards(data_dir, "train")
+    val_paths = discover_shards(data_dir, "val")
     vocab_size, observed_max = detect_vocab_size(train_paths + val_paths)
     if is_master:
         print(f"[data] {len(train_paths)} train shards, {len(val_paths)} val shards, "
@@ -802,7 +851,7 @@ def main():
         eval_interval=args.eval_interval, eval_batches=args.eval_batches,
         seq_len=args.seq_len, batch_size=args.batch_size,
         micro_batch_size=args.micro_batch_size,
-        data_dir=args.data_dir, out_dir=args.out_dir,
+        data_dir=data_dir, out_dir=args.out_dir,
     )
 
     # held-out windows: validation uses the middle 80% of the val shard,
@@ -812,10 +861,17 @@ def main():
     test_window = (int(0.90 * val_total), val_total)
 
     results_path = os.path.join(args.out_dir, "all_runs_metrics.json")
+    # Every rank must load this, not just rank 0. The skip test below runs on all
+    # ranks, so with `and is_master` rank 0 would skip finished cells while rank 1
+    # re-ran them: the two ranks then enter train_single_run on different
+    # (model, seed) pairs and deadlock in the first all-reduce. A fresh run is
+    # unaffected (the file does not exist, everyone gets []), which is exactly why
+    # this only bites on resume.
     all_results = []
-    if os.path.exists(results_path) and is_master:
+    if os.path.exists(results_path):
         try:
-            all_results = json.load(open(results_path))
+            with open(results_path) as f:
+                all_results = json.load(f)
         except Exception:
             all_results = []
 

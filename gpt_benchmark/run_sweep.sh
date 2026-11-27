@@ -6,6 +6,9 @@
 # Detached with setsid+nohup so an SSH drop cannot kill it. Resumable:
 # run_cyclic_gpt_benchmark.py skips (model, seed) cells already present in
 # all_runs_metrics.json, so re-running this script continues where it stopped.
+#
+# Data: --data_dir takes precedence; otherwise DATA_DIR is honoured, then
+# ./data, then the path this benchmark was originally developed against.
 set -u
 cd "$(dirname "$0")" || exit 1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
